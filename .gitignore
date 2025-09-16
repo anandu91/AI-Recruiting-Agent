@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# App data (DO NOT COMMIT)
+app.db
+*.sqlite
+*.sqlite3
+/chroma/
+/chroma.sqlite3
+
+# Notebooks/Data (optional)
+*.ipynb_checkpoints/
+data/
+
+# Editors/OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Front-end (if any)
+node_modules/
+dist/
+build/
+
+# Streamlit cache
+.streamlit/
