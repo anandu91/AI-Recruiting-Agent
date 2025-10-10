@@ -24,7 +24,8 @@ from functools import lru_cache
 from typing import List, Dict, Any, Tuple, Optional
 import calendar
 
-# Prefer embeddings if available; otherwise fall back to a 1D hash embedding
+# Prefer embeddings if available; otherwise our embeddings module provides
+# a robust deterministic fallback (32-D hash+sin/cos) transparently.
 try:
     from app.core.embeddings import embed_texts
     _HAS_EMB = True
@@ -39,7 +40,7 @@ _VERSION_TAIL = re.compile(r"(?:^|\b)(?:v)?\d+(?:\.\d+){0,2}\b$")
 
 def _key(s: str) -> str:
     s = (s or "").lower().strip()
-    # keep symbols meaningful for tech: + # . / -
+    # keep symbols meaningful for tech: + # . / -.
     s = re.sub(r"[^\w+#./-]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -83,7 +84,7 @@ def _cos(u: List[float], v: List[float]) -> float:
 @lru_cache(maxsize=2048)
 def _embed_cached(token: str) -> Tuple[float, ...]:
     if not _HAS_EMB:
-        # Fallback: 1D hash embedding to keep code paths unified
+        # rarely used: import failure path
         return (float(abs(hash(token)) % 997) / 997.0, )
     vec = embed_texts([token])[0]
     return tuple(float(x) for x in vec)
@@ -352,22 +353,63 @@ def _recent_relevant_usage(resume_text: str, jd_canon_names: List[str], recency_
 
     return False
 
-# === BOOSTS: start - per-skill recency/work detection =========================
+# === BOOSTS via stored metadata (fast path) ================================
+
+def _per_skill_boosts_from_meta(
+    cand_meta: Dict[str, Dict[str, Any]],
+    skill_token: str
+) -> Tuple[float, float]:
+    """
+    Compute (recency_boost, work_boost) from stored metadata:
+      - months_since_used: int|null
+      - used_in_work: bool
+    """
+    meta = cand_meta.get(skill_token) or {}
+    months = meta.get("months_since_used")
+    used_in_work = bool(meta.get("used_in_work", False))
+
+    # recency mapping
+    if isinstance(months, int):
+        if months <= 12:
+            recency = 3.0
+        elif months <= 24:
+            recency = 2.0
+        else:
+            recency = 1.0  # seen historically but older
+    else:
+        # unknown months: grant +1 only if the skill exists in the candidate map (presence)
+        # caller ensures this is only invoked for skills in cmap
+        recency = 1.0
+
+    work = 1.0 if used_in_work else 0.0
+    return recency, work
+
+def _recent_relevant_from_meta(
+    cand_meta: Dict[str, Dict[str, Any]],
+    jd_canon_names: List[str],
+    recency_months: int
+) -> bool:
+    for s in jd_canon_names:
+        m = cand_meta.get(s) or {}
+        months = m.get("months_since_used")
+        if isinstance(months, int) and months <= recency_months:
+            return True
+    return False
+
+# === BOOSTS: text-based (fallback when no meta) ============================
+
 def _per_skill_boosts(resume_text: str, skill_token: str) -> Tuple[float, float]:
     """
-    Compute (recency_boost, work_boost) for a single canonical skill.
+    Compute (recency_boost, work_boost) for a single canonical skill by scanning text.
 
-    NEW RECENCY RULES (Neil):
-      - +3.0 if used within 12 months
-      - +2.0 if used within 24 months
-      - +1.0 if the skill appears anywhere in the resume (even with no dated evidence)
-      - +0.0 if not mentioned at all
+    RECENCY:
+      +3.0 if used within 12 months
+      +2.0 if used within 24 months
+      +1.0 if the skill appears anywhere (even without dates)
+      +0.0 if not mentioned
 
-    WORK RULE (unchanged):
-      - +1.0 if the skill is mentioned within ±600 chars of a dated employment range.
-
-    We search for month/year contexts to estimate recency, but we DON'T require
-    a dated section to grant the basic +1 presence bonus.
+    WORK:
+      +1.0 if the skill is mentioned within ±600 chars of a dated employment range.
     """
     if not (resume_text or "").strip() or not (skill_token or "").strip():
         return 0.0, 0.0
@@ -385,7 +427,7 @@ def _per_skill_boosts(resume_text: str, skill_token: str) -> Tuple[float, float]
     recency_best: Optional[int] = None
     work_hit = False
 
-    # Employment ranges like "Jan 2021 - Present" (to detect WORK windows and recency)
+    # Employment ranges like "Jan 2021 - Present"
     for m in re.finditer(rf"({monthyear})\s*(?:to|-|–|—)\s*(present|current|now|{monthyear})", txt, re.I):
         end_tok = (m.group(2) or "").strip()
         end_dt = now if re.match(r"(present|current|now)$", end_tok, re.I) else _parse_month_year(end_tok)
@@ -406,7 +448,7 @@ def _per_skill_boosts(resume_text: str, skill_token: str) -> Tuple[float, float]
         if recency_best is None or months < recency_best:
             recency_best = months
 
-    # Also consider isolated month-year mentions (not necessarily within job ranges)
+    # Also consider isolated month-year mentions
     for m in re.finditer(monthyear, txt, re.I):
         dt = _parse_month_year(m.group(0))
         if not dt:
@@ -433,7 +475,6 @@ def _per_skill_boosts(resume_text: str, skill_token: str) -> Tuple[float, float]
 
     work_boost = 1.0 if work_hit else 0.0
     return recency_boost, work_boost
-# === BOOSTS: end ===============================================================
 
 
 # ---------- main ranking (Skills + Experience only) ----------
@@ -484,6 +525,7 @@ def rank_candidates_weighted(
     jd_text: Optional[str] = None,                 # unused here; kept for signature stability
     recency_months: int = 24,                      # align with UI gate
     resume_texts: Optional[Dict[str, str]] = None, # resume_id -> raw_text for recency check
+    skills_meta_map: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,  # NEW: fast boosts
     # Back-compat shim for old callers/tests:
     exp_weight: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
@@ -496,7 +538,7 @@ def rank_candidates_weighted(
          - contribution_0to5 = jd_weight * final_strength
          - Skills Score (0..10) = (Σ contributions / 5.0) * 10.0
       4) Experience component (0..10) contributes ONLY if resume shows at least one JD skill
-         in a date window that ends within `recency_months`.
+         in a date window that ends within `recency_months`. (Uses skills_meta_map if present.)
       5) Final score = skills*mix['skills'] + experience*mix['experience'].
     """
     # Back-compat: if caller passed exp_weight, derive mix_weights
@@ -534,6 +576,7 @@ def rank_candidates_weighted(
         contrib_sum = 0.0
 
         resume_txt = (resume_texts or {}).get(rid, "") if resume_texts is not None else ""
+        cand_meta = (skills_meta_map or {}).get(rid) if skills_meta_map is not None else None
 
         for item in jd_norm:
             s = item["name"]
@@ -542,9 +585,14 @@ def rank_candidates_weighted(
             is_main = (s == main_skill)
 
             main_boost = 2.0 if is_main else 0.0
-            recency_boost, work_boost = (0.0, 0.0)
-            if resume_texts is not None and resume_txt:
+
+            if cand_meta is not None and s in cmap:  # fast path: use stored meta
+                recency_boost, work_boost = _per_skill_boosts_from_meta(cand_meta, s)
+            elif resume_texts is not None and resume_txt:
                 recency_boost, work_boost = _per_skill_boosts(resume_txt, s)
+            else:
+                # no info → only presence yields +1 recency if present, else 0
+                recency_boost, work_boost = ((1.0 if s in cmap else 0.0), 0.0)
 
             final_strength = min(5.0, max(0.0, raw_strength + main_boost + recency_boost + work_boost))
             contribution = w * final_strength
@@ -567,10 +615,16 @@ def rank_candidates_weighted(
         # Skills score 0..10
         skills_score_10 = ( (contrib_sum / 5.0) * 10.0 ) if jd_norm else 0.0
 
-        # Experience gating (recent+relevant across ANY JD skill)
+        # Experience gating
         exp_component_10 = 0.0
-        if (exp_years or 0.0) and resume_texts is not None:
-            recent_and_relevant = _recent_relevant_usage(resume_txt, jd_names, recency_months)
+        if (exp_years or 0.0):
+            if cand_meta is not None:
+                recent_and_relevant = _recent_relevant_from_meta(cand_meta, jd_names, recency_months)
+            elif resume_texts is not None:
+                recent_and_relevant = _recent_relevant_usage(resume_txt, jd_names, recency_months)
+            else:
+                recent_and_relevant = False
+
             if recent_and_relevant:
                 exp_component_10 = min(10.0, float(exp_years or 0.0))
         else:

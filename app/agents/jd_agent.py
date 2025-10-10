@@ -229,6 +229,33 @@ def jd_extract_skills(jd_text: str, max_items: int = 30) -> Dict[str, Any]:
     # type guard so UI always receives [{"name","weight"}...]
     return _coerce_skills_payload({"skills": cleaned})
 
+# ============== Convenience API expected by pipeline ===================
+def parse_jd_to_weighted_skills(jd_text: str) -> Dict[str, float]:
+    """
+    Pipeline-friendly API:
+    Returns a canonical mapping {skill: weight} with skills lowercased,
+    weights in [0,1], and at most 30 entries.
+    """
+    payload = jd_extract_skills(jd_text, max_items=30)
+    items = payload.get("skills", []) if isinstance(payload, dict) else []
+    out: Dict[str, float] = {}
+    for it in items:
+        name = (it.get("name") or "").strip().lower()
+        if not name:
+            continue
+        try:
+            w = float(it.get("weight", 0.0))
+        except Exception:
+            w = 0.0
+        w = max(0.0, min(1.0, w))
+        if w <= 0.0:
+            continue
+        # keep highest weight if duplicates
+        if name not in out or w > out[name]:
+            out[name] = w
+    # clip to 30 by weight desc, name asc
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0]))[:30])
+
 # ========================== CrewAI agent (compat) ======================
 def build_jd_agent(model: str = "gpt-4o") -> Agent:
     _wire_do_env_for_crewai()

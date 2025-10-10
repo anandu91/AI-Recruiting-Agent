@@ -1,9 +1,21 @@
 # app/pipeline/crew_pipeline.py
+from __future__ import annotations
+
 import os
+import json
+import hashlib
 from typing import Dict, Any, List, Tuple, Optional
 
 from app.agents.jd_agent import jd_extract_skills, build_jd_agent
-from app.core.storage import fetch_candidate, fetch_all_candidate_skillmaps
+from app.core.storage import (
+    fetch_candidate,
+    fetch_all_candidate_skillmaps,
+    shortlist_by_jd_skills,
+    load_for_ranking,
+    get_rank_cache,
+    set_rank_cache,
+    get_data_version,
+)
 from app.core.ranking import rank_candidates_weighted
 
 
@@ -54,10 +66,53 @@ def _enforce_hints(
     return out[:30]
 
 
+def _canonicalize_skills_for_cache(skills: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
+    """
+    Deterministic canonical vector for cache keys:
+    - lowercase trimmed names, numeric weights
+    - sort by (weight desc, name asc)
+    """
+    vec = []
+    for it in (skills or []):
+        nm = (it.get("name") or "").strip().lower()
+        if not nm:
+            continue
+        try:
+            wt = float(it.get("weight", 0.0))
+        except Exception:
+            wt = 0.0
+        if wt > 0:
+            vec.append((nm, max(0.0, min(1.0, wt))))
+    vec.sort(key=lambda t: (-t[1], t[0]))
+    return vec[:30]
+
+
+def _rank_cache_key(
+    skills: List[Dict[str, Any]],
+    mix_weights: Optional[Dict[str, float]],
+    recency_months: int,
+    data_version: int,
+) -> str:
+    """Stable SHA256 key of (canonical JD vector + mix + recency + data_version)."""
+    canon = _canonicalize_skills_for_cache(skills)
+    mix = {
+        "skills": float((mix_weights or {}).get("skills", 0.85)),
+        "experience": float((mix_weights or {}).get("experience", 0.15)),
+    }
+    payload = {
+        "jd_canon": canon,
+        "mix": {"skills": round(mix["skills"], 6), "experience": round(mix["experience"], 6)},
+        "recency_months": int(recency_months),
+        "data_version": int(data_version),
+    }
+    s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
 class RecruitingCrew:
     """
-    JD parsing (strict JSON via two-pass extractor) + deterministic ranking
-    (weighted skills + recent-relevant experience, no education).
+    JD parsing (strict JSON via two-pass extractor) + retrieval + deterministic ranking
+    (weighted skills + recent-relevant experience, no education), with rank caching.
     """
     def __init__(self, collection=None, openai_model: str = "gpt-4o"):
         self.model = os.getenv("DO_OPENAI_MODEL", openai_model)
@@ -120,6 +175,46 @@ class RecruitingCrew:
         cleaned = _enforce_hints(cleaned, ui_hints)
         return {"skills": cleaned[:30]}
 
+    # ---- Matching helpers ----
+    def _rank_with_shortlist(
+        self,
+        jd_req: Dict[str, Any],
+        *,
+        top_k: int,
+        mix_weights: Optional[Dict[str, float]],
+        recency_months: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieval-first shortlist (Chroma) → load data → rank deterministically.
+        Falls back to DB-only shortlist inside storage if Chroma is unavailable.
+        """
+        jd_skills = jd_req.get("skills") or []
+        if not jd_skills:
+            return []
+
+        # Weighted skill → shortlist ids
+        jd_weights = { (s.get("name") or "").strip().lower(): float(s.get("weight", 0.0)) for s in jd_skills if s.get("name") }
+        shortlist_ids = shortlist_by_jd_skills(jd_weights, k=max(500, top_k))
+
+        if not shortlist_ids:
+            return []
+
+        # Load only the shortlisted candidate data (profiles, skillmaps, skills_meta_map, resume_texts)
+        rows_all, skillmaps, skills_meta_map, resume_texts = load_for_ranking(shortlist_ids)
+
+        # Rank (pass skills_meta_map to avoid resume text scans when available)
+        ranked = rank_candidates_weighted(
+            jd_skills,
+            rows_all,
+            skillmaps,
+            top_k=top_k,
+            mix_weights=mix_weights,
+            recency_months=recency_months,
+            resume_texts=resume_texts,
+            skills_meta_map=skills_meta_map,
+        )
+        return ranked
+
     def match(
         self,
         jd_req: Dict[str, Any],
@@ -132,6 +227,11 @@ class RecruitingCrew:
         resume_texts: Optional[Dict[str, str]] = None,
         jd_text: str = "",
     ):
+        """
+        Back-compat entrypoint used by older callers/tests that pass preloaded rows/maps.
+        Uses the modern ranker with optional resume_texts (for gating) but without retrieval.
+        Prefer using .run() which performs retrieval + caching.
+        """
         jd_skills = jd_req.get("skills") or []
         return rank_candidates_weighted(
             jd_skills, rows_all, all_skillmaps,
@@ -155,27 +255,42 @@ class RecruitingCrew:
         resume_texts: Optional[Dict[str, str]] = None,
         ui_hints: Optional[Dict[str, List[str]]] = None,
     ):
+        """
+        New path:
+          1) Parse JD (or take provided jd_req)
+          2) Compute rank cache key and return cached if fresh
+          3) Retrieval-first shortlist via Chroma (fallback DB)
+          4) Rank deterministically
+          5) Write cache
+        """
         # Parse JD (or accept a pre-parsed request)
         if jd_req is None:
             jd_req = self.parse_jd(jd_text or "", ui_hints=ui_hints)
 
-        # Skill maps fallback
-        if all_skillmaps is None:
-            all_skillmaps = fetch_all_candidate_skillmaps()
+        jd_skills = jd_req.get("skills") or []
+        if not jd_skills:
+            return jd_req, []
 
-        # Resume texts fallback (for recent+relevant experience gating)
-        if resume_texts is None:
-            resume_texts = {}
-            for rid, *_ in rows_all:
-                c = fetch_candidate(rid) or {}
-                resume_texts[rid] = c.get("raw_text", "") or ""
+        # Cache lookup
+        data_version = get_data_version()
+        cache_key = _rank_cache_key(jd_skills, mix_weights, recency_months, data_version)
+        cached = get_rank_cache(cache_key)
+        if cached and int(cached.get("data_version", -1)) == data_version:
+            payload = cached.get("payload") or []
+            return jd_req, (payload[:top_k] if top_k else payload)
 
-        ranked = self.match(
-            jd_req, rows_all, all_skillmaps,
+        # Retrieval-first shortlist + load and rank
+        ranked = self._rank_with_shortlist(
+            jd_req,
             top_k=top_k,
             mix_weights=mix_weights,
             recency_months=recency_months,
-            resume_texts=resume_texts,
-            jd_text=jd_text or "",
         )
+
+        # Write cache
+        try:
+            set_rank_cache(cache_key, ranked, data_version)
+        except Exception:
+            pass
+
         return jd_req, ranked
