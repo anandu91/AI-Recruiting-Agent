@@ -1,3 +1,4 @@
+# app/core/ranking.py
 """
 Deterministic ranking: Skills + Experience (no education).
 Experience contributes ONLY if the resume shows usage of at least one JD skill
@@ -56,7 +57,9 @@ def _base_token(raw: str) -> str:
     Lightweight base tokenization:
       - lowercase + collapse whitespace
       - drop explicit trailing version tokens: "java 8" -> "java"
-      - drop inline jammed versions: "python3" -> "python", "c++11" -> "c++"
+      - carefully drop inline jammed versions when they are clearly version-like:
+        "python3" -> "python", "c++11" -> "c++"
+        (but KEEP short letter+digit identifiers like "db2", "s3", "ec2")
       - collapse separators: node js / node.js -> nodejs
     """
     k = _key(raw)
@@ -65,8 +68,14 @@ def _base_token(raw: str) -> str:
     # handle jammed suffix versions like python3, java8, nodejs14, c++11
     no_space = k.replace(" ", "")
     m = re.match(r"(?i)([a-z][a-z0-9+#.]*?)(?:v)?(\d{1,2}(?:\.\d+)*)$", no_space)
-    if m and len(m.group(1)) >= 2:  # avoid stripping things like "s3", "mp3"
-        k = m.group(1)
+    if m:
+        letters, digits = m.group(1), m.group(2)
+        # Heuristic guardrails:
+        # - Keep short letter+digit tech tokens intact (<=4 chars total), e.g., db2, s3, ec2, gke
+        # - Only strip when token is reasonably long (>4) and has enough alpha context (>=3),
+        #   which strongly suggests a version suffix rather than the identity of the tech.
+        if len(no_space) > 4 and len(letters) >= 3:
+            k = letters
 
     # collapse common separators
     merged = re.sub(r"[.\s/]+", "", k)
@@ -86,19 +95,30 @@ def _embed_cached(token: str) -> Tuple[float, ...]:
     if not _HAS_EMB:
         # rarely used: import failure path
         return (float(abs(hash(token)) % 997) / 997.0, )
-    vec = embed_texts([token])[0]
-    return tuple(float(x) for x in vec)
+    try:
+        vec = embed_texts([token])[0]
+        return tuple(float(x) for x in vec)
+    except Exception:
+        # deterministic per-token fallback if backend fails at runtime
+        return (float(abs(hash(token)) % 997) / 997.0, )
 
 def _embed_many(tokens: List[str]) -> List[Tuple[float, ...]]:
     if not _HAS_EMB:
         return [_embed_cached(t) for t in tokens]
-    embs = embed_texts(tokens)
-    return [tuple(float(x) for x in e) for e in embs]
+    try:
+        embs = embed_texts(tokens)
+        return [tuple(float(x) for x in e) for e in embs]
+    except Exception:
+        # fallback gracefully per-token
+        return [_embed_cached(t) for t in tokens]
 
-def _build_clusters(tokens: List[str], sim_thresh: float = 0.78) -> Dict[str, str]:
+def _build_clusters(tokens: List[str], sim_thresh: float = 0.90) -> Dict[str, str]:
     """
     Greedy agglomeration: group tokens whose cosine similarity >= sim_thresh.
     Representative is the shortest string (ties -> lexicographic).
+
+    Stricter threshold + guardrails to prevent over-merge of short/digit-suffixed tokens
+    (e.g., 'db2' should not cluster with 'dbt'; 's3' should not cluster with 'sql').
     """
     if not tokens:
         return {}
@@ -129,6 +149,17 @@ def _build_clusters(tokens: List[str], sim_thresh: float = 0.78) -> Dict[str, st
         vi = vecs[i]
         for j in range(i + 1, len(uniq)):
             vj = vecs[j]
+            ti, tj = uniq[i], uniq[j]
+
+            # Guardrails to avoid over-merge of short/different-style tokens:
+            # 1) don't cluster very short tokens (<=4 chars) with anything else
+            if len(ti) <= 4 or len(tj) <= 4:
+                continue
+            # 2) don't cluster tokens when one ends with a digit and the other doesn't
+            #    (e.g., db2 vs dbt)
+            if ti[-1].isdigit() != tj[-1].isdigit():
+                continue
+
             if _cos(vi, vj) >= sim_thresh:
                 union(i, j)
 
@@ -267,6 +298,25 @@ def _month_from_str(s: str) -> Optional[int]:
         return 9
     return None
 
+def _year2(s: Optional[str]) -> Optional[int]:
+    """
+    Parse 2-digit years. Assumption window: 90–99 -> 1990s, 00–89 -> 2000–2089.
+    """
+    if not s:
+        return None
+    s = s.strip().strip("'")
+    if re.fullmatch(r"\d{2}", s):
+        yy = int(s)
+        return 1900 + yy if yy >= 90 else 2000 + yy
+    return None
+
+def _parse_year_token(tok: Optional[str]) -> Optional[int]:
+    if tok is None:
+        return None
+    if re.fullmatch(r"19[8-9]\d|20[0-5]\d", tok):
+        return int(tok)
+    return _year2(tok)
+
 def _parse_month_year(token: str) -> Optional[datetime]:
     """
     Parse a single month-year-ish token safely.
@@ -274,35 +324,53 @@ def _parse_month_year(token: str) -> Optional[datetime]:
       - Sep 2023 / September 2023
       - 2023-09 / 09/2023 / 2023/9
       - 2023  (treated as Dec 1, 2023)
+      - Jul'21 (→ 2021-07-01)
+      - 07/21 (→ 2021-07-01) with 2-digit year mapping
     Returns None if it can't be parsed.
     """
     t = (token or "").strip().lower().replace("–", "-").replace("—", "-").replace("\\", "/")
+    t = t.replace("’", "'")
 
-    # "September 2023" or "Sep 2023"
-    m = re.match(r"\b([a-z]{3,9})\.?\s+(\d{4})\b", t, flags=re.I)
+    # "September 2023" or "Sep 2023" or "Sep'23"
+    m = re.match(r"\b([a-z]{3,9})\.?\s*'?(19[8-9]\d|20[0-5]\d|\d{2})\b", t, flags=re.I)
     if m:
         mm = _month_from_str(m.group(1))
-        if mm:
-            return datetime(int(m.group(2)), mm, 1)
+        yy = _parse_year_token(m.group(2))
+        if mm and yy:
+            return datetime(yy, mm, 1)
 
     # "2023-09" or "2023/09"
-    m = re.match(r"\b(20\d{2})[-/](\d{1,2})\b", t)
+    m = re.match(r"\b(19[8-9]\d|20[0-5]\d)[-/](\d{1,2})\b", t)
     if m:
         year, month = int(m.group(1)), int(m.group(2))
         if 1 <= month <= 12:
             return datetime(year, month, 1)
 
     # "09/2023" or "9-2023"
-    m = re.match(r"\b(\d{1,2})[-/](20\d{2})\b", t)
+    m = re.match(r"\b(\d{1,2})[-/](19[8-9]\d|20[0-5]\d)\b", t)
     if m:
         month, year = int(m.group(1)), int(m.group(2))
         if 1 <= month <= 12:
             return datetime(year, month, 1)
 
-    # "2023" only
-    m = re.match(r"\b(20\d{2})\b", t)
+    # "07/21" or "7-21"  (2-digit year)
+    m = re.match(r"\b(\d{1,2})[-/](\d{2})\b", t)
+    if m:
+        month, yy2 = int(m.group(1)), _year2(m.group(2))
+        if 1 <= month <= 12 and yy2:
+            return datetime(yy2, month, 1)
+
+    # "2023" or "1999" only
+    m = re.match(r"\b(19[8-9]\d|20[0-5]\d)\b", t)
     if m:
         return datetime(int(m.group(1)), 12, 1)
+
+    # "’21" or "'21" (assume December)
+    m = re.match(r"^'(\d{2})$", t)
+    if m:
+        yy2 = _year2(m.group(1))
+        if yy2:
+            return datetime(yy2, 12, 1)
 
     return None
 
@@ -323,8 +391,13 @@ def _recent_relevant_usage(resume_text: str, jd_canon_names: List[str], recency_
     if not jd_tokens:
         return False
 
-    # windows tied to ranges like "Jan 2022 - Present" or "2021-05 - 2023-02"
-    monthyear = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{4}|\d{4}[-/]\d{1,2}|\d{1,2}[-/]\d{4}|\d{4}"
+    monthyear = (
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(?:19[8-9]\d|20[0-5]\d)"
+        r"|\b(?:19[8-9]\d|20[0-5]\d)[-/]\d{1,2}\b"
+        r"|\b\d{1,2}[-/](?:19[8-9]\d|20[0-5]\d)\b"
+        r"|\b(?:19[8-9]\d|20[0-5]\d)\b"
+        r"|\b'\d{2}\b"
+    )
     for m in re.finditer(rf"({monthyear})\s*(?:to|-|–|—)\s*(present|current|now|{monthyear})", txt, re.I):
         end_tok = (m.group(2) or "").strip()
         end_dt = now if re.match(r"(present|current|now)$", end_tok, re.I) else _parse_month_year(end_tok)
@@ -422,7 +495,13 @@ def _per_skill_boosts(resume_text: str, skill_token: str) -> Tuple[float, float]
     collapsed_all = re.sub(r"[.\s/]+", "", _key(txt))
     appears_anywhere = bool(tok and tok in collapsed_all)
 
-    monthyear = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{4}|\d{4}[-/]\d{1,2}|\d{1,2}[-/]\d{4}|\d{4}"
+    monthyear = (
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(?:19[8-9]\d|20[0-5]\d)"
+        r"|\b(?:19[8-9]\d|20[0-5]\d)[-/]\d{1,2}\b"
+        r"|\b\d{1,2}[-/](?:19[8-9]\d|20[0-5]\d)\b"
+        r"|\b(?:19[8-9]\d|20[0-5]\d)\b"
+        r"|\b'\d{2}\b"
+    )
 
     recency_best: Optional[int] = None
     work_hit = False
@@ -490,7 +569,7 @@ def _normalize_mix_weights(mix: Dict[str, float] | None) -> Dict[str, float]:
     m["skills"] /= s; m["experience"] /= s
     return m
 
-# NEW: internal constants and helper to derive primary skills from JD weights
+# Internal constants and helper to derive primary skills from JD weights
 PRIMARY_CUM_WEIGHT = 0.60   # take top skills until ≥60% cumulative weight
 PRIMARY_MIN = 3
 PRIMARY_MAX = 8
@@ -525,7 +604,7 @@ def rank_candidates_weighted(
     jd_text: Optional[str] = None,                 # unused here; kept for signature stability
     recency_months: int = 24,                      # align with UI gate
     resume_texts: Optional[Dict[str, str]] = None, # resume_id -> raw_text for recency check
-    skills_meta_map: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,  # NEW: fast boosts
+    skills_meta_map: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,  # fast boosts
     # Back-compat shim for old callers/tests:
     exp_weight: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
@@ -555,7 +634,7 @@ def rank_candidates_weighted(
     jd_canon = _canon_jd_list(jd_skills, base_to_canon)
     jd_norm = normalize_weights(jd_canon)
 
-    # NEW: compute a deterministic primary list once for all candidates
+    # compute a deterministic primary list once for all candidates
     primary_names = _derive_primary_names(jd_norm)
 
     out: List[Dict[str, Any]] = []

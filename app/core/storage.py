@@ -90,6 +90,11 @@ def init_sqlite() -> None:
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_candidates_email ON candidates(email);
         """))
+        # NEW: functional index to speed case-insensitive lookups
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_candidates_email_lower ON candidates(lower(email));
+        """))
+
         # skills (one-to-many)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS candidate_skills (
@@ -286,7 +291,8 @@ def _chroma_delete_by_resume(collection, resume_id: str) -> None:
 
 def _index_skills_in_chroma(resume_id: str, email: str, skills: Dict[str, float]) -> None:
     """
-    Index each skill as a separate vector with metadata {resume_id, skill, email, strength}.
+    Index each skill as a separate vector with metadata {resume_id, skill, strength}.
+    (GDPR-minimization: do NOT store email in vector metadata.)
     """
     if not skills:
         return
@@ -300,14 +306,12 @@ def _index_skills_in_chroma(resume_id: str, email: str, skills: Dict[str, float]
 
     # Prepare embeddings
     skill_names = list(skills.keys())
-    if not _HAS_EMB:
-        # embeddings module provides a deterministic fallback transparently
-        pass
-    embs = embed_texts(skill_names) if _HAS_EMB else embed_texts(skill_names)
+    embs = embed_texts(skill_names)
 
     ids = [f"{resume_id}::{s}" for s in skill_names]
+    # Drop email from metadata to minimize PII footprint
     metadatas = [
-        {"resume_id": resume_id, "skill": s, "email": (email or ""), "strength": float(skills.get(s, 0.0))}
+        {"resume_id": resume_id, "skill": s, "strength": float(skills.get(s, 0.0))}
         for s in skill_names
     ]
     try:
@@ -331,13 +335,14 @@ def upsert_candidate(
     """
     Upsert candidate and replace skills & skill_meta. Also updates Chroma index for this resume.
     Bumps data_version to invalidate caches.
+    - Protects against overwriting existing name/email with blank strings.
     """
     _exec("""
         INSERT INTO candidates(resume_id,name,email,education,experience,raw_text)
         VALUES(:rid,:name,:email,:education,:experience,:raw_text)
         ON CONFLICT(resume_id) DO UPDATE SET
-            name=excluded.name,
-            email=excluded.email,
+            name=COALESCE(NULLIF(excluded.name,''), candidates.name),
+            email=COALESCE(NULLIF(excluded.email,''), candidates.email),
             education=excluded.education,
             experience=excluded.experience,
             raw_text=excluded.raw_text;
@@ -380,7 +385,7 @@ def upsert_candidate(
                     VALUES(:rid, :skill, :months, :work)
                 """), {"rid": rid, "skill": sk, "months": months, "work": used_in_work})
 
-    # Update Chroma index
+    # Update Chroma index (email intentionally unused in metadata)
     try:
         _index_skills_in_chroma(rid, email, skills or {})
     except Exception:

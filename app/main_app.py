@@ -14,12 +14,12 @@ from typing import List, Dict, Any
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
-from openai import OpenAI
 
 from app.core.storage import (
     init_sqlite, get_chroma, upsert_candidate, fetch_candidate,
-    fetch_all_candidate_skillmaps, add_note, mark_submission, set_stage,
+    add_note, mark_submission, set_stage,
     migrate_add_email, find_resume_id_by_email,
+    load_skillmaps_for,  # ✅ selective skills loader
 )
 from app.core.parsing import extract_text_from_bytes, guess_education
 from app.core.embeddings import embed_texts
@@ -131,20 +131,26 @@ _client, _collection = get_chroma()
 
 # ── Helpers -------------------------------------------------------------------
 
-# Fallback identity heuristics (to guarantee we have a real name/email if LLM is empty)
+def _normalize_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+# Fallback identity heuristics (local only — never sent to the LLM)
 _EMAIL_RE = re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b")
-_PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
-_NAME_LINE_RE = re.compile(r"(?m)^\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*$")
+# phone: at least 7 digits total, allow separators/parentheses
+_PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{0,3})?(?:\d[\d\s().-]{0,3}){6,14}\d")
+# simple human name line (2–4 capitalized tokens) early in the doc
+_NAME_LINE_RE = re.compile(r"(?m)^\s*([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,3})\s*$")
 
 def _guess_identity(text: str) -> Dict[str, str]:
-    """Very small, local heuristic to extract name/email/phone if LLM returns blanks."""
-    name = ""
-    email = ""
-    phone = ""
+    """Local heuristic to extract name/email/phone if LLM returns blanks."""
+    name, email, phone = "", "", ""
     m = _EMAIL_RE.search(text or "")
     if m: email = m.group(0).strip()
-    m2 = _PHONE_RE.search(text or "")
-    if m2: phone = m2.group(0).strip()
+    for m2 in _PHONE_RE.finditer(text or ""):
+        digits = re.sub(r"\D", "", m2.group(0))
+        if 7 <= len(digits) <= 15:
+            phone = m2.group(0).strip()
+            break
     for line in (text or "").splitlines()[:25]:
         l = line.strip()
         if _NAME_LINE_RE.match(l):
@@ -177,26 +183,29 @@ def _display_experience_years(stored: float, resume_text: str) -> float:
     est = _estimate_years_from_text(resume_text or "")
     return max(s, est)
 
-# Pretty skill name for chips
-_ACRONYMS = {"ai","ml","api","qa","sre","etl","elt","ci","cd","sql","dbt","aws","gcp","gke","nlp","rest","sdk","ui","ux","db2"}
+# Pretty skill name for chips (generic, resume-agnostic)
 def _pretty_skill(s: str) -> str:
+    """
+    Display-only formatter: keeps the ranking/data untouched.
+    - Splits on non-alphanumerics
+    - Short alphabetic tokens (<=4) uppercased (ai, ml, qa, ui, ux, sql → AI, ML, QA, UI, UX, SQL)
+    - Mixed alphanumerics like DB2/S3 kept as-is if already mixed case
+    - Everything else Title Case
+    """
     raw = (s or "").strip()
-    base = _base_token(raw)
-    low = base.lower()
-    if low in _ACRONYMS: return low.upper()
-    if low.startswith("apache") and len(low) > 6:
-        rest = low[6:]
-        if rest: return "Apache" + rest.capitalize()
-    SPECIAL = {
-        "bigquery": "BigQuery", "kubernetes": "Kubernetes", "airflow": "Airflow",
-        "terraform": "Terraform", "docker": "Docker", "cloudcomposer": "Cloud Composer",
-        "springboot": "Spring Boot", "dataproc": "Dataproc",
-    }
-    if low in SPECIAL: return SPECIAL[low]
-    parts = re.split(r"[^a-z0-9]+", low)
-    parts = [p for p in parts if p]
-    if not parts: return raw
-    return " ".join(p.upper() if p in _ACRONYMS else p.capitalize() for p in parts)
+    if not raw:
+        return raw
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", raw) if p]
+
+    def fmt(tok: str) -> str:
+        t = tok.strip()
+        if len(t) <= 4 and t.isalpha():
+            return t.upper()
+        if any(ch.isupper() for ch in t) and any(ch.isdigit() for ch in t):
+            return t
+        return t.capitalize()
+
+    return " ".join(fmt(p) for p in parts)
 
 # JD skill chips preparation
 def _jd_display_and_canon(jd_req: Dict[str, Any], all_skillmaps: Dict[str, Dict[str, float]]):
@@ -218,7 +227,9 @@ def _jd_display_and_canon(jd_req: Dict[str, Any], all_skillmaps: Dict[str, Dict[
 # Left donuts
 def render_contrib_donuts_small(r: Dict[str, Any], sel_key: str) -> None:
     rows = sorted(r.get("per_skill_rows") or [], key=lambda x: (-float(x.get("contribution_0to5", 0.0)), x.get("skill", "")))[:5]
-    if not rows: st.info("No per-skill rows."); return
+    if not rows:
+        st.info("No per-skill rows.")
+        return
     st.caption("JD contributions (top 5)")
     cols = st.columns(5, gap="small")
     for i, row in enumerate(rows):
@@ -336,8 +347,6 @@ def render_candidate_cards(
 
         matched_list = r.get("matched_skills", []) or []  # canonical names
         missing_list = r.get("missing_skills", []) or []
-        matched_csv = ", ".join(matched_list) if matched_list else ""
-        missing_csv = ", ".join(missing_list) if missing_list else ""
 
         st.markdown(f"""
         <div class="cand-card">
@@ -370,7 +379,7 @@ def render_candidate_cards(
                 for k,_ in skills_sorted:
                     canon_k = base_to_canon.get(_base_token(k), _base_token(k))
                     cls = "chip ok" if canon_k in jd_canon_set else "chip"
-                    chips.append(f'<span class="{cls}">{k}</span>')
+                    chips.append(f'<span class="{cls}">{_pretty_skill(k)}</span>')
                 st.markdown(f'<div class="chips">{"".join(chips)}</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
@@ -380,7 +389,7 @@ def render_candidate_cards(
         if jd_items and per_rows:
             rid = r.get("resume_id","")
             sel_key = f"sel_skill_{rid}"
-            if sel_key not in st.session_state:
+            if sel_key not in st.session_state and per_rows:
                 top_skill = max(per_rows, key=lambda x: (float(x.get("contribution_0to5", 0.0)), x.get("skill","")))["skill"]
                 st.session_state[sel_key] = top_skill
 
@@ -428,23 +437,26 @@ if uploaded_files:
             if not text.strip():
                 st.warning(f"Could not parse {f.name}"); continue
 
-            # Primary: LLM extractor
+            # Primary: extractor (LLM sees anonymized text inside resume_agent)
             fields = extract_resume_fields(text)
 
-            # Hard fallbacks to guarantee display identity (this fixes filename-as-name & blank email)
+            # Hard fallbacks to guarantee display identity (prevents filename-as-name)
             local = _guess_identity(text)
             full_name = (fields.get("full_name") or "").strip() or local["name"]
             email = (fields.get("email") or "").strip() or local["email"]
 
-            # De-dup by email if we have one
-            existing_rid = find_resume_id_by_email(email) if email else None
+            # De-dup by normalized email if we have one
+            existing_rid = None
+            if email:
+                existing_rid = find_resume_id_by_email(_normalize_email(email))
 
             resume_id = existing_rid or _safe_rid_from_filename(f.name)
+
             if not full_name:
-                # ultimate fallback so cards never show the file stem as “final” name again
-                full_name = full_name or local["name"] or resume_id.replace("_", " ")
+                full_name = local["name"] or resume_id.replace("_", " ")
 
             skills_map = fields.get("skills_map") or {}
+            skills_meta = fields.get("skills_meta") or {}  # NEW: persist usage meta
             edu_level = fields.get("education_level") or guess_education(text)
             try:
                 exp_years = float(fields.get("experience_years") or 0.0)
@@ -457,6 +469,7 @@ if uploaded_files:
                 "email": email,
                 "text": text,
                 "skills_map": skills_map,
+                "skills_meta": skills_meta,
                 "education": edu_level,
                 "experience": exp_years
             })
@@ -467,6 +480,7 @@ if uploaded_files:
                 rid=e["resume_id"], name=e["name"], email=e["email"],
                 education=e["education"], experience=e["experience"],
                 raw_text=e["text"], skills=e["skills_map"],
+                skills_meta=e.get("skills_meta") or {},  # NEW
             )
 
         st.session_state["ingest_counter"] = st.session_state.get("ingest_counter", 0) + 1
@@ -488,7 +502,7 @@ def _dedup_by_email_preserve_order(ranked_rows: List[Dict[str, Any]], desired_k:
         rid = r.get("resume_id", "")
         if not rid: continue
         c = fetch_candidate(rid) or {}
-        email_map[rid] = (c.get("email","") or "").strip().lower()
+        email_map[rid] = _normalize_email(c.get("email",""))
     out, seen = [], set()
     for r in ranked_rows:
         rid = r.get("resume_id", "")
@@ -514,7 +528,10 @@ if st.button("Rank / Re-Rank Candidates"):
         )
         ranked = _dedup_by_email_preserve_order(raw_ranked, int(top_k))
 
-        all_maps_raw = fetch_all_candidate_skillmaps()
+        # ✅ Load only the skills you need for the ranked candidates
+        needed_ids = [r.get("resume_id","") for r in ranked if r.get("resume_id")]
+        all_maps_raw = load_skillmaps_for(needed_ids)
+
         st.session_state["ranked"] = ranked
         st.session_state["jd_req"] = jd_req_parsed
         st.session_state["jd_text"] = jd_text or ""
@@ -618,11 +635,12 @@ if selected_resume_id:
             if not new_text.strip():
                 st.warning("Could not parse the updated file.")
             else:
-                fields2 = extract_resume_fields(new_text)
+                fields2 = extract_resume_fields(new_text)  # anonymization happens inside
                 local2 = _guess_identity(new_text)
                 new_name  = (fields2.get("full_name") or "").strip() or local2["name"] or cand.get("name", selected_resume_id)
                 new_email = (fields2.get("email") or "").strip() or local2["email"] or cand.get("email","")
                 new_skills = fields2.get("skills_map") or {}
+                new_skills_meta = fields2.get("skills_meta") or {}  # NEW: persist usage meta
                 new_edu = (fields2.get("education_level") or guess_education(new_text))
                 try:
                     new_exp = float(fields2.get("experience_years") or 0.0)
@@ -632,5 +650,6 @@ if selected_resume_id:
                 upsert_candidate(
                     rid=selected_resume_id, name=new_name[:80], email=new_email,
                     education=new_edu, experience=new_exp, raw_text=new_text, skills=new_skills,
+                    skills_meta=new_skills_meta,  # NEW
                 )
                 st.success("Updated resume ingested and re-indexed.")
